@@ -34,11 +34,21 @@ OFFLINE_AFTER = 15 * 60          # seconds without any request -> agent is offli
 MAX_MESSAGES = 5000
 MAX_WAIT = 300
 
+# Persistent sessions: the first turn starts a conversation, every next turn resumes it.
+# {msg} = short instruction pointing to the turn file, {session} = runner-generated UUID.
 PRESETS = {
-    # prompt goes to stdin unless the command contains {prompt_file}
-    "claude": "claude -p --dangerously-skip-permissions",
-    "codex": "codex exec --dangerously-bypass-approvals-and-sandbox -",
-    "opencode": 'opencode run "Read the file {prompt_file} and follow the instructions in it exactly."',
+    "claude": {
+        "start": ["claude", "-p", "--dangerously-skip-permissions", "--session-id", "{session}", "{msg}"],
+        "resume": ["claude", "-p", "--dangerously-skip-permissions", "--resume", "{session}", "{msg}"],
+    },
+    "codex": {
+        "start": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{msg}"],
+        "resume": ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "resume", "--last", "{msg}"],
+    },
+    "opencode": {
+        "start": ["opencode", "run", "{msg}"],
+        "resume": ["opencode", "run", "--continue", "{msg}"],
+    },
 }
 
 for _s in (sys.stdout, sys.stderr):
@@ -99,18 +109,20 @@ If your tool kills long-running commands, use a smaller `wait --timeout`.
 ## 1. Startup - distribute roles
 1. `{sw} status` - read the goal, who is lead, who is online, roles, tasks.
 2. `git pull --rebase` and get familiar with the repository.
-3. If you are the LEAD:
+3. Everyone introduces themselves:
+   `{sw} send "Hi, I'm {name} (<your product/model>). Strengths: ..."`
+4. If you are the LEAD:
    - give teammates time to join: `{sw} wait --timeout 60` a few times (about 3 minutes
-     total) or until a human says "start". Read their intro messages.
-   - decide roles by strengths and the goal (e.g. architect, backend, frontend,
-     tester/reviewer, docs). Assign them to everyone, yourself included: `{sw} role NAME ROLE`.
-   - split the goal into small, independent tasks - preferably by files/modules so agents
-     don't conflict - and create them: `{sw} task add "..." --desc "..." --to NAME`.
-   - broadcast a short plan with `{sw} send`.
-4. If you are NOT the lead: introduce yourself with
-   `{sw} send "Hi, I'm {name} (<your product/model>). Strengths: ..."`,
-   then `{sw} wait` for your role and tasks. You may propose ideas or another split;
-   discuss briefly - the lead decides, humans override everyone.
+     total) or until a human says "start". Read their intros.
+   - post a PROPOSAL, not orders: how you understand the goal, the architecture / approach,
+     the role split (architect, backend, frontend, tester/reviewer, docs...) and the first
+     tasks. Ask each teammate for their opinion.
+   - DISCUSS: answer objections, adopt better ideas, 1-3 rounds. Then finalize: assign roles
+     (`{sw} role NAME ROLE`, yourself included), create tasks split by files/modules so
+     agents don't conflict (`{sw} task add "..." --desc "..." --to NAME`), and announce it.
+5. If you are NOT the lead: when the proposal arrives, really think about it and reply
+   with concrete feedback: what you'd change, risks, a better idea, what you want to take.
+   Disagreeing is welcome - with arguments. The lead decides; humans override everyone.
 
 ## 2. Work loop (repeat until the goal is done)
 1. `{sw} inbox`. Messages of kind=human are TOP PRIORITY and override the plan.
@@ -123,13 +135,26 @@ If your tool kills long-running commands, use a smaller `wait --timeout`.
    (API changes, decisions, blockers, review results).
 6. Nothing to do? `{sw} wait` and repeat. Don't end your session while the goal is unfinished.
 
-## 3. Rules
+## 3. Talk to each other - you are a team, not isolated workers
+- Ask teammates directly when you need something from them: `{sw} send --to NAME "..."`.
+  Answer questions addressed to you promptly and concretely.
+- Before a significant design decision (interfaces between modules, data formats,
+  architecture, new dependencies) post a short proposal and give others a chance to object.
+- Announce everything others depend on: APIs/interfaces you created or changed, file
+  layout, how to run/test.
+- Review each other: after a teammate's push, look at the diff (`git show`) when it touches
+  your area or your role is reviewer, and send feedback - bugs, better approaches, praise
+  for good solutions is fine too but keep it short.
+- If you think the plan or a teammate's approach is wrong, say so with reasons and propose
+  an alternative. Resolve disagreements by argument; if stuck, the lead (or a human) decides.
+- Share ideas: improvements beyond your task are welcome as proposals in the chat.
+
+## 4. Rules
 - Teammates' work arrives as commits. After a "pushed" notification: `git pull --rebase`,
   then `git log` / `git show` to see what changed. Reviewers review new commits and report
   problems as tasks or messages.
-- Discuss before big or irreversible changes (architecture, new dependencies, mass renames):
-  post a proposal and wait one `wait` cycle for objections.
-- Keep messages short and concrete. Don't reply just to acknowledge.
+- Keep messages short and concrete. Don't reply just to acknowledge ("ok", "thanks") -
+  every message should carry information, a question, an opinion or a decision.
 - Don't edit files covered by another agent's in-progress task without agreeing first.
 - Blocked? `{sw} task block ID --note "why"` and tell the lead (or a human).
 - When the goal is complete, the lead posts a final summary and asks the humans what's next.
@@ -338,8 +363,9 @@ class Hub:
                     break
                 self.cond.wait(min(left, 30))
                 self._touch(name)
-            if not peek:
+            if not peek and a.get("cursor") != self.state["next_msg"] - 1:
                 a["cursor"] = self.state["next_msg"] - 1
+                self.save()
             a["last_seen"] = now()
             return {"messages": msgs}
 
@@ -991,66 +1017,158 @@ def cmd_chat(a):
         last[0] = max(last[0], m["id"])
 
 
-def build_run_prompt(c, msgs):
+RUNNER_INTRO = """
+---
+# HOW THIS SESSION WORKS (persistent team member)
+
+This is a LONG-LIVED conversation. You are a permanent member of the team chat. A runner
+keeps this session alive: whenever teammates or humans write something, you get a new
+turn in THIS SAME conversation with the new chat messages, so you remember everything
+that was discussed before.
+
+On every turn:
+- Read the new messages. Answer questions addressed to you, give your honest opinion in
+  discussions (agree, object, propose alternatives), coordinate who does what.
+- Then do your share of the work (pull, code, commit, push, update tasks).
+- Talk to teammates ONLY with `send` - your normal reply text is seen by no one.
+- If you are in a live discussion and expect a quick answer, you may run
+  `{sw} wait --timeout 60` (up to ~3 times in a row) and continue in the same turn.
+  Otherwise just end your turn - you will be woken up when new messages arrive.
+  Ending a turn does NOT mean leaving the team.
+- Messages delivered in a turn are already marked as read (don't call `inbox` for them).
+"""
+
+
+def runner_turn_text(c, msgs, first):
     st = c.call("/api/state")
     me = next((x for x in st["agents"] if x["name"] == c.name), {})
     mine = [t for t in st["tasks"] if t["assignee"] == c.name and t["status"] != "done"]
     free = [t for t in st["tasks"] if not t["assignee"] and t["status"] == "open"]
-    parts = [render_protocol(c.name, c.hub), "\n---\n# CURRENT SITUATION (autonomous runner mode)\n",
-             "You are started repeatedly by a runner. Do ONE meaningful step of work now (pull, act, "
-             "commit, push, report with `send`/`task`), then finish your reply. Do NOT call `wait` - "
-             "the runner waits for new messages and starts you again. Messages below are already "
-             "marked as read.\n",
-             "GOAL: %s" % (st["goal"] or "(not set - ask the humans)"),
-             "LEAD: %s%s" % (st["lead"], "  <- that's you" if st["lead"] == c.name else ""),
-             "YOUR ROLE: %s" % (me.get("role") or "(unassigned)"),
-             "AGENTS: " + ", ".join("%s(%s%s)" % (x["name"], x["role"] or "no role",
-                                                  "" if x["online"] else ", offline") for x in st["agents"]),
-             "\nYOUR TASKS:\n" + ("\n".join(fmt_task(t) for t in mine) or "(none)"),
-             "\nUNASSIGNED OPEN TASKS:\n" + ("\n".join(fmt_task(t) for t in free) or "(none)"),
-             "\nNEW MESSAGES:\n" + ("\n".join(fmt_msg(m) for m in msgs) or "(none)")]
+    parts = []
+    if first:
+        parts += [render_protocol(c.name, c.hub), RUNNER_INTRO.replace("{sw}", sw_command()),
+                  "---\n# TURN 1 - you just joined the team. Follow section 1 (Startup) of the protocol.\n"]
+    else:
+        parts += ["# NEW TURN (%s) - new chat messages arrived\n" % time.strftime("%H:%M")]
+    parts += ["GOAL: %s" % (st["goal"] or "(not set - ask the humans)"),
+              "LEAD: %s%s" % (st["lead"], "  <- that's you" if st["lead"] == c.name else ""),
+              "YOUR ROLE: %s" % (me.get("role") or "(unassigned)"),
+              "TEAM: " + ", ".join("%s(%s%s)" % (x["name"], x["role"] or "no role",
+                                                 "" if x["online"] else ", offline") for x in st["agents"]),
+              "\nYOUR TASKS:\n" + ("\n".join(fmt_task(t) for t in mine) or "(none)"),
+              "\nUNASSIGNED OPEN TASKS:\n" + ("\n".join(fmt_task(t) for t in free) or "(none)"),
+              "\nNEW MESSAGES:\n" + ("\n".join(fmt_msg(m) for m in msgs) or "(none)")]
+    if not first and not msgs and mine:
+        parts.append("\n(No new messages - you were woken up because your tasks are unfinished. "
+                     "Continue working on them or report what blocks you.)")
     return "\n".join(parts), mine
 
 
+def _wakes(m, me):
+    """Chat messages always wake the agent; system notices only if they concern it or are pushes."""
+    if m["kind"] != "system" or m["to"] == me or "pushed to" in m["text"]:
+        return True
+    return re.search(r"(?<![\w.-])%s(?![\w.-])" % re.escape(me), m["text"]) is not None
+
+
+def _exec_agent(spec, ws, values, prompt):
+    """spec is a preset (argv list) or a custom shell string. Returns exit code."""
+    if isinstance(spec, list):
+        args = [x for x in spec]
+        for k, v in values.items():
+            args = [x.replace("{%s}" % k, v) for x in args]
+        exe = shutil.which(args[0])
+        if not exe:
+            die("'%s' not found in PATH - is the agent CLI installed?" % args[0])
+        return subprocess.run([exe] + args[1:], cwd=ws).returncode
+    cmd = spec
+    for k, v in values.items():
+        cmd = cmd.replace("{%s}" % k, v)
+    if "{prompt_file}" in spec or "{msg}" in spec:
+        return subprocess.run(cmd, shell=True, cwd=ws).returncode
+    return subprocess.run(cmd, shell=True, cwd=ws, input=prompt.encode("utf-8")).returncode
+
+
 def cmd_run(a):
+    import uuid
     c, cfg = client_from(a)
     c.need_name()
-    cmd = a.cmd or PRESETS.get(a.agent or "")
-    if not cmd:
-        die("pass --agent %s or --cmd \"your agent command\"" % "|".join(PRESETS))
-    ws = os.path.dirname(os.path.dirname(find_config() or os.path.join(os.getcwd(), ".git", "x")))
+    preset = PRESETS.get(a.agent or "")
+    start_cmd = a.cmd or (preset and preset["start"])
+    if a.cmd:
+        resume_cmd = a.resume_cmd
+    else:
+        resume_cmd = a.resume_cmd or (preset["resume"] if preset else None)
+    if not start_cmd:
+        die("pass --agent %s, or --cmd \"...\" [--resume-cmd \"...\"]" % "|".join(sorted(PRESETS)))
+    cfg_path = find_config()
+    ws = os.path.dirname(os.path.dirname(cfg_path)) if cfg_path else os.getcwd()
+    gitdir = os.path.join(ws, ".git")
+    sess_path = os.path.join(gitdir, "swarm-session.json")
+    sess = {}
+    if os.path.exists(sess_path) and not a.fresh:
+        with open(sess_path, encoding="utf-8") as f:
+            sess = json.load(f)
+    if sess.get("agent") != (a.agent or a.cmd):
+        sess = {}
+    if not sess:
+        sess = {"agent": a.agent or a.cmd, "session": str(uuid.uuid4()), "turns": 0}
+
+    def save_sess():
+        with open(sess_path, "w", encoding="utf-8") as f:
+            json.dump(sess, f)
+
+    turn_file = os.path.join(gitdir, "swarm-turn.md")
+    values = {"session": sess["session"], "prompt_file": turn_file.replace("\\", "/"),
+              "msg": "Read the file %s and act on it." % turn_file.replace("\\", "/")}
     c.call("/api/join", {"name": c.name, "kind": cfg.get("kind") or a.agent or "agent"})
-    print("runner: %s in %s\n  command: %s\n  Ctrl+C to stop." % (c.name, ws, cmd))
-    runs, first, last_run = 0, True, 0.0
+    print("runner: %s in %s\n  session: %s (%s)\n  Ctrl+C to stop; the session is kept, start again to continue it."
+          % (c.name, ws, sess["session"], "continuing, %d turns so far" % sess["turns"] if sess["turns"] else "new"))
+    pending, last_turn, fails, turns_now = [], 0.0, 0, 0
     try:
-        while a.max_runs <= 0 or runs < a.max_runs:
-            wait = 0 if first else a.idle
-            msgs = c.inbox(wait)
-            if not first and msgs:
-                gap = a.cooldown - (now() - last_run)
-                if gap > 0:  # batch messages that arrive in quick succession
-                    time.sleep(gap)
-                    msgs += c.inbox(0)
-            prompt, mine = build_run_prompt(c, msgs)
-            if not (first or msgs or mine):
-                continue
-            first = False
-            runs += 1
-            print("\n=== run %d at %s (%d new messages, %d own tasks) ===" % (
-                runs, time.strftime("%H:%M:%S"), len(msgs), len(mine)), flush=True)
-            pf = os.path.join(ws, ".git", "swarm-run-prompt.md")
-            with open(pf, "w", encoding="utf-8") as f:
-                f.write(prompt)
-            if "{prompt_file}" in cmd:
-                r = subprocess.run(cmd.replace("{prompt_file}", pf.replace("\\", "/")), shell=True, cwd=ws)
+        while a.max_turns <= 0 or turns_now < a.max_turns:
+            first = sess["turns"] == 0
+            if first:
+                pending += c.inbox(0)
             else:
-                r = subprocess.run(cmd, shell=True, cwd=ws, input=prompt.encode("utf-8"))
-            last_run = now()
-            if r.returncode != 0:
-                print("runner: agent exited with code %d, retrying after %ds" % (r.returncode, a.cooldown))
-                time.sleep(a.cooldown)
+                left = a.idle - (now() - last_turn) if last_turn else a.idle
+                retry = any(_wakes(m, c.name) for m in pending)  # undelivered after a failed turn
+                pending += c.inbox(0 if retry else int(max(5, min(left, MAX_WAIT))))
+                if any(_wakes(m, c.name) for m in pending):
+                    gap = a.cooldown - (now() - last_turn)
+                    if gap > 0:  # let a burst of messages accumulate into one turn
+                        time.sleep(gap)
+                        pending += c.inbox(0)
+                elif now() - last_turn < a.idle:
+                    continue
+            text, mine = runner_turn_text(c, pending, first)
+            if not (first or any(_wakes(m, c.name) for m in pending) or mine):
+                last_turn = now()  # idle with nothing to do: keep waiting
+                continue
+            with open(turn_file, "w", encoding="utf-8") as f:
+                f.write(text)
+            use_resume = not first and resume_cmd
+            print("\n=== turn %d at %s (%d new messages, %d own tasks)%s ===" % (
+                sess["turns"] + 1, time.strftime("%H:%M:%S"), len(pending), len(mine),
+                "" if use_resume or first else " [no resume command: fresh context]"), flush=True)
+            code = _exec_agent(resume_cmd if use_resume else start_cmd, ws, values, text)
+            last_turn = now()
+            if code == 0:
+                sess["turns"] += 1
+                turns_now += 1
+                save_sess()
+                pending, fails = [], 0
+                continue
+            fails += 1
+            print("runner: agent exited with code %d (messages kept for the next try)" % code)
+            if fails >= 2 and use_resume:
+                print("runner: cannot resume the session - starting a new one")
+                sess.update(session=str(uuid.uuid4()), turns=0)
+                values["session"] = sess["session"]
+                save_sess()
+            time.sleep(a.cooldown * fails)
     except KeyboardInterrupt:
-        print("\nrunner stopped")
+        print("\nrunner stopped (session kept)")
 
 
 def cmd_protocol(a):
@@ -1206,12 +1324,15 @@ def main():
     s.add_argument("agent")
     s.set_defaults(fn=cmd_lead)
     sub.add_parser("chat", help="terminal chat for humans").set_defaults(fn=cmd_chat)
-    s = sub.add_parser("run", help="autonomous mode: start your agent CLI whenever there is work")
-    s.add_argument("--agent", choices=sorted(PRESETS), help="preset command")
-    s.add_argument("--cmd", help="custom agent command; prompt goes to stdin, or use {prompt_file}")
-    s.add_argument("--idle", type=int, default=600, help="max seconds to wait for messages between runs")
-    s.add_argument("--cooldown", type=int, default=20, help="min seconds between runs")
-    s.add_argument("--max-runs", type=int, default=0, help="stop after N runs (0 = forever)")
+    s = sub.add_parser("run", help="keep your agent in the team chat as a persistent session")
+    s.add_argument("--agent", choices=sorted(PRESETS), help="preset for claude / codex / opencode")
+    s.add_argument("--cmd", help="custom command for the FIRST turn; placeholders {prompt_file} {msg} "
+                                 "{session}; without {prompt_file}/{msg} the turn text goes to stdin")
+    s.add_argument("--resume-cmd", help="custom command for the NEXT turns (continues the session)")
+    s.add_argument("--fresh", action="store_true", help="forget the saved session and start a new one")
+    s.add_argument("--idle", type=int, default=600, help="wake up after N s without messages if you have unfinished tasks")
+    s.add_argument("--cooldown", type=int, default=10, help="collect messages for N s before a turn")
+    s.add_argument("--max-turns", type=int, default=0, help="stop after N turns (0 = forever)")
     s.set_defaults(fn=cmd_run)
 
     a = p.parse_args()
